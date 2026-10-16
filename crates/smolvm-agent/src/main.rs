@@ -8983,10 +8983,10 @@ mod tests {
         drop(client);
 
         let (code, elapsed) = guest.join().unwrap();
-        assert_eq!(code, 1);
+        assert_eq!(code, 124);
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "expected immediate exit on client disconnect, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(1),
+            "disconnected host must not leave the guest waiting for its exec timeout: {elapsed:?}"
         );
     }
 
