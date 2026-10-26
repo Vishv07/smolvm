@@ -244,6 +244,8 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     manifest.network = vm.network;
+    manifest.allowed_cidrs = vm.allowed_cidrs.clone();
+    manifest.dns_filter_hosts = vm.dns_filter_hosts.clone();
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
     // Carry the record's (entrypoint, cmd) through as-is. An empty entrypoint
@@ -260,6 +262,56 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     // resolves it: the machine's own user wins, else the image's USER.
     manifest.user = vm.user.clone().or_else(|| assets.image_user.clone());
     manifest.secret_refs = vm.secret_refs.clone();
+}
+
+/// Validated `(allowed_cidrs, dns_filter_hosts)` pair extracted from a pack manifest.
+pub type ValidatedEgressAllowList = (Option<Vec<String>>, Option<Vec<String>>);
+
+/// Validate and normalize the outbound allow-list carried by an untrusted
+/// [`PackManifest`], holding its CIDRs and host patterns to the same rules
+/// `machine create` enforces.
+pub fn validated_manifest_egress(
+    manifest: &PackManifest,
+) -> crate::Result<ValidatedEgressAllowList> {
+    let allowed_cidrs = match &manifest.allowed_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed allowed_cidrs", reason))?,
+        ),
+        None => None,
+    };
+    let dns_filter_hosts = match &manifest.dns_filter_hosts {
+        Some(hosts) => Some(
+            hosts
+                .iter()
+                .map(|entry| validate_packed_host_entry(entry))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed dns_filter_hosts", reason))?,
+        ),
+        None => None,
+    };
+    Ok((allowed_cidrs, dns_filter_hosts))
+}
+
+fn validate_packed_host_entry(entry: &str) -> std::result::Result<String, String> {
+    match entry.strip_prefix('=') {
+        Some(exact) if !exact.starts_with("*.") => {
+            smolvm_protocol::host_pattern::encode_strict(exact)
+        }
+        Some(_) => Err(format!(
+            "invalid host pattern {entry:?}: use an exact DNS hostname or *.domain"
+        )),
+        None => smolvm_protocol::host_pattern::encode_strict(entry).map(|encoded| {
+            if entry.starts_with("*.") {
+                encoded
+            } else {
+                entry.trim_end_matches('.').to_ascii_lowercase()
+            }
+        }),
+    }
 }
 
 /// Layer a machine's own env over the image's declared env, as `KEY=VALUE`.
@@ -1784,7 +1836,10 @@ mod env_merge_tests {
 
 #[cfg(test)]
 mod from_vm_manifest_tests {
-    use super::{export_dns, export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use super::{
+        export_dns, export_overlay_owner, seed_manifest_from_vm, validated_manifest_egress,
+        FromVmAssets,
+    };
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
 
@@ -1888,6 +1943,49 @@ mod from_vm_manifest_tests {
 
         assert_eq!(m.entrypoint, vec!["/app/server"]);
         assert_eq!(m.cmd, vec!["--port", "8080"]);
+    }
+
+    /// Issue #1989: packing a networked machine that was scoped with
+    /// `--allow-host` or `--allow-cidr` must carry that allow-list into the
+    /// manifest instead of leaving `manifest.network = true` with no allow-list
+    /// (which silently widened the packed machine to open internet).
+    #[test]
+    fn seed_manifest_from_vm_preserves_egress_allow_list() {
+        let mut rec = record("scoped");
+        rec.network = true;
+        rec.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        rec.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "=exact.example.com".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert!(m.network);
+        assert_eq!(m.allowed_cidrs, rec.allowed_cidrs);
+        assert_eq!(m.dns_filter_hosts, rec.dns_filter_hosts);
+        assert_eq!(
+            validated_manifest_egress(&m).unwrap(),
+            (rec.allowed_cidrs, rec.dns_filter_hosts)
+        );
+    }
+
+    #[test]
+    fn validated_manifest_egress_rejects_malformed_cidrs_and_hosts() {
+        let mut bad_cidr = manifest();
+        bad_cidr.allowed_cidrs = Some(vec!["not-a-cidr".to_string()]);
+        assert!(validated_manifest_egress(&bad_cidr).is_err());
+
+        for bad_host in ["", "*", "https://pypi.org", "1.2.3.4", "=*.pypi.org"] {
+            let mut bad = manifest();
+            bad.dns_filter_hosts = Some(vec![bad_host.to_string()]);
+            assert!(
+                validated_manifest_egress(&bad).is_err(),
+                "{bad_host:?} must be rejected"
+            );
+        }
     }
 
     /// A branched or checkpoint-restored machine keeps writing to its source's

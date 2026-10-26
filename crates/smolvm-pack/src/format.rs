@@ -793,6 +793,17 @@ pub struct PackManifest {
     #[serde(default)]
     pub network: bool,
 
+    /// Outbound CIDR allow-list carried with the pack (`--allow-cidr` /
+    /// `--outbound-localhost-only` / resolved `--allow-host`). Absent means
+    /// no CIDR restriction (or unrestricted when `dns_filter_hosts` is also absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Hostnames and patterns permitted by the guest DNS filter (`--allow-host` /
+    /// `--allow-host-pattern`). Absent means no hostname filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -922,6 +933,8 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            allowed_cidrs: None,
+            dns_filter_hosts: None,
             gpu: false,
             cuda: false,
             host_platform,
@@ -975,8 +988,17 @@ mod tests {
             !json.contains("secret_refs"),
             "empty secret_refs must not be serialized"
         );
+        assert!(
+            !json.contains("allowed_cidrs") && !json.contains("dns_filter_hosts"),
+            "absent egress allow-list fields must not be serialized"
+        );
 
         let mut m = empty;
+        m.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        m.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
         m.secret_refs.insert(
             "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
@@ -991,6 +1013,8 @@ mod tests {
             restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
             Some("PGPASSWORD")
         );
+        assert_eq!(restored.allowed_cidrs, m.allowed_cidrs);
+        assert_eq!(restored.dns_filter_hosts, m.dns_filter_hosts);
     }
 
     #[test]

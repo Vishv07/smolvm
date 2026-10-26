@@ -151,17 +151,26 @@ fn resolve_egress_flags(
 
 fn smolmachine_egress_fields(
     manifest_network: bool,
+    manifest_allowed_cidrs: Option<Vec<String>>,
+    manifest_dns_filter_hosts: Option<Vec<String>>,
     allow_cidrs: Vec<String>,
     cli_network: bool,
     dns_filter_hosts: Option<Vec<String>>,
 ) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
-    let allowed_cidrs = if allow_cidrs.is_empty() {
+    let cli_allowed_cidrs = if allow_cidrs.is_empty() {
         None
     } else {
         Some(allow_cidrs)
     };
+    let (allowed_cidrs, dns_filter_hosts) =
+        if cli_allowed_cidrs.is_some() || dns_filter_hosts.is_some() {
+            (cli_allowed_cidrs, dns_filter_hosts)
+        } else {
+            (manifest_allowed_cidrs, manifest_dns_filter_hosts)
+        };
+    let has_egress = allowed_cidrs.is_some() || dns_filter_hosts.is_some();
     (
-        manifest_network || cli_network,
+        manifest_network || cli_network || has_egress,
         allowed_cidrs,
         dns_filter_hosts,
     )
@@ -2908,16 +2917,50 @@ mod tests {
         let cidrs = vec!["192.0.2.10/32".to_string()];
         let hosts = Some(vec!["provider.test".to_string()]);
         assert_eq!(
-            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
+            smolmachine_egress_fields(
+                false,
+                Some(vec!["198.51.100.1/32".to_string()]),
+                Some(vec!["baked.test".to_string()]),
+                cidrs.clone(),
+                true,
+                hosts.clone(),
+            ),
             (true, Some(cidrs), hosts)
+        );
+        // A CLI host pattern with no CIDRs still replaces the pack's baked
+        // CIDRs as a unit rather than leaving the old hosts' IPs allowed.
+        let pattern = Some(vec!["=only.test".to_string()]);
+        assert_eq!(
+            smolmachine_egress_fields(
+                true,
+                Some(vec!["198.51.100.1/32".to_string()]),
+                Some(vec!["baked.test".to_string()]),
+                Vec::new(),
+                true,
+                pattern.clone(),
+            ),
+            (true, None, pattern)
         );
     }
 
     #[test]
     fn smolmachine_egress_fields_preserve_manifest_network_default() {
         assert_eq!(
-            smolmachine_egress_fields(true, Vec::new(), false, None),
+            smolmachine_egress_fields(true, None, None, Vec::new(), false, None),
             (true, None, None)
+        );
+        let baked_cidrs = Some(vec!["198.51.100.1/32".to_string()]);
+        let baked_hosts = Some(vec!["pypi.org".to_string()]);
+        assert_eq!(
+            smolmachine_egress_fields(
+                true,
+                baked_cidrs.clone(),
+                baked_hosts.clone(),
+                Vec::new(),
+                false,
+                None,
+            ),
+            (true, baked_cidrs, baked_hosts)
         );
     }
 
@@ -5216,6 +5259,8 @@ impl CreateCmd {
             }
         }
 
+        let (manifest_allowed_cidrs, manifest_dns_filter_hosts) =
+            smolvm::pack_export::validated_manifest_egress(&manifest)?;
         let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
             self.allow_host.clone(),
@@ -5225,6 +5270,8 @@ impl CreateCmd {
         )?;
         let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
             manifest.network,
+            manifest_allowed_cidrs,
+            manifest_dns_filter_hosts,
             cli_allow_cidrs,
             cli_network,
             cli_dns_filter_hosts,

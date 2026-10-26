@@ -2888,6 +2888,8 @@ async fn create_machine_to_end(
         manifest_cpus,
         manifest_mem,
         manifest_net,
+        manifest_allowed_cidrs,
+        manifest_allowed_hosts,
         manifest_secret_refs,
         vm_seed,
         manifest_checkpoint,
@@ -2964,6 +2966,9 @@ async fn create_machine_to_end(
                 },
             )?;
         }
+        let (manifest_allowed_cidrs, manifest_allowed_hosts) =
+            crate::pack_export::validated_manifest_egress(&manifest)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         // VM-mode packs carry disks, not layers — capture the templates so the
         // machine's overlay/storage disks can be seeded from them below.
         let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
@@ -3021,6 +3026,8 @@ async fn create_machine_to_end(
             manifest.cpus,
             manifest.mem,
             manifest.network,
+            manifest_allowed_cidrs,
+            manifest_allowed_hosts,
             manifest.secret_refs,
             vm_seed,
             checkpoint,
@@ -3036,6 +3043,8 @@ async fn create_machine_to_end(
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
             crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
+            None,
+            None,
             Default::default(),
             None,
             None,
@@ -3096,11 +3105,18 @@ async fn create_machine_to_end(
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
         None => req.network_backend,
     };
-    let restored_allowed_hosts = checkpoint_network
-        .and_then(|network| network.dns_filter_hosts.clone())
-        .or_else(|| req.allowed_hosts.clone());
+    let caller_overrides_egress = normalized_cidrs.is_some() || req.allowed_hosts.is_some();
+    let restored_allowed_hosts = if let Some(network) = checkpoint_network {
+        network.dns_filter_hosts.clone()
+    } else if caller_overrides_egress {
+        req.allowed_hosts.clone()
+    } else {
+        manifest_allowed_hosts
+    };
     if let Some(network) = checkpoint_network {
         normalized_cidrs = network.allowed_cidrs.clone();
+    } else if !caller_overrides_egress {
+        normalized_cidrs = manifest_allowed_cidrs;
     }
 
     // Use explicit API resources when provided. Otherwise, preserve packed
@@ -3136,7 +3152,7 @@ async fn create_machine_to_end(
     }
     crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
         .map_err(ApiError::BadRequest)?;
-    // Reject invalid resources up front (as the CLI does at create time), so the
+    // Reject invalid resources up front (as the API does at create time), so the
     // API returns a clear 400 here instead of persisting an unbootable machine
     // that only fails with a deferred 500 when it is later started.
     crate::data::resources::VmResources {
@@ -3148,9 +3164,12 @@ async fn create_machine_to_end(
     }
     .validate()
     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let network = checkpoint_network
-        .map(|network| network.enabled)
-        .unwrap_or(req.network || manifest_net);
+    let network = checkpoint_network.map(|network| network.enabled).unwrap_or(
+        req.network
+            || manifest_net
+            || normalized_cidrs.is_some()
+            || restored_allowed_hosts.is_some(),
+    );
 
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);

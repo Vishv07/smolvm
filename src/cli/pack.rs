@@ -1024,6 +1024,8 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.allowed_cidrs = pack_config.allowed_cidrs;
+        manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
         manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
@@ -1181,6 +1183,14 @@ impl PackCreateCmd {
         // Smolfile > source VM record > default
         if let Some(net) = pack_config.net {
             manifest.network = net;
+            if !net {
+                manifest.allowed_cidrs = None;
+                manifest.dns_filter_hosts = None;
+            }
+        }
+        if pack_config.allowed_cidrs.is_some() || pack_config.dns_filter_hosts.is_some() {
+            manifest.allowed_cidrs = pack_config.allowed_cidrs;
+            manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
         }
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || manifest.gpu;

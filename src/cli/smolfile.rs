@@ -517,6 +517,10 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Outbound CIDR allow-list from `[network].allow_cidrs`.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames and patterns from `[network].allow_hosts` / `allow_host_patterns`.
+    pub dns_filter_hosts: Option<Vec<String>>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
     /// Secrets carried into the pack manifest as references. They are resolved
@@ -603,6 +607,8 @@ pub fn resolve_pack_config_with_defaults(
                 workdir: None,
                 user: None,
                 net: None,
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
                 gpu: cli_gpu,
                 secret_refs: Default::default(),
             });
@@ -645,6 +651,30 @@ pub fn resolve_pack_config_with_defaults(
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
 
+    let (allowed_cidrs, dns_filter_hosts) = match sf.network.as_ref() {
+        Some(network) => {
+            let cidrs = network
+                .allow_cidrs
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] allow_cidrs", e))?;
+            let mut hosts = network.allow_hosts.clone();
+            for pattern in &network.allow_host_patterns {
+                hosts.push(
+                    smolvm_protocol::host_pattern::encode_strict(pattern).map_err(|e| {
+                        smolvm::Error::config("smolfile [network] allow_host_patterns", e)
+                    })?,
+                );
+            }
+            (
+                (!cidrs.is_empty()).then_some(cidrs),
+                (!hosts.is_empty()).then_some(hosts),
+            )
+        }
+        None => (None, None),
+    };
+
     Ok(PackConfig {
         image,
         entrypoint,
@@ -671,6 +701,8 @@ pub fn resolve_pack_config_with_defaults(
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        allowed_cidrs,
+        dns_filter_hosts,
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
         secret_refs: sf.secrets,
@@ -717,6 +749,7 @@ mod tests {
     /// manifest). Add a line per hop when adding a launch setting.
     #[test]
     fn every_launch_setting_survives_every_hop() {
+        use crate::cli::pack_run::{effective_pack_allow_list, resolve_packed_launch};
         use crate::cli::vm_common::{apply_overrides, build_vm_record, DefaultVmOverrides};
         use smolvm::config::VmRecord;
         use smolvm::pack_export::{seed_manifest_from_vm, FromVmAssets};
@@ -736,10 +769,14 @@ env = ["GREETING=hello", "EMPTY="]
 workdir = "/srv/app"
 user = "501:20"
 init = ["echo init"]
+
+[network]
+allow_cidrs = ["1.1.1.1/32"]
+allow_host_patterns = ["*.example.com"]
 "#,
         )
         .unwrap();
-        let params = build_from_smolfile(path).unwrap();
+        let params = build_from_smolfile(path.clone()).unwrap();
 
         // Hop 1: Smolfile -> create params.
         assert_eq!(params.image.as_deref(), Some("library/alpine:latest"));
@@ -750,6 +787,17 @@ init = ["echo init"]
         assert_eq!(params.user.as_deref(), Some("501:20"));
         assert_eq!(params.init, vec!["echo init"]);
         assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
+        assert_eq!(params.allowed_cidrs, Some(vec!["1.1.1.1/32".to_string()]));
+        assert_eq!(
+            params.dns_filter_hosts,
+            Some(vec!["*.example.com".to_string()])
+        );
+
+        // Hop 1b: Smolfile -> pack config, the `pack create --smolfile` path.
+        let pack_config =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).unwrap();
+        assert_eq!(pack_config.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(pack_config.dns_filter_hosts, params.dns_filter_hosts);
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -767,6 +815,8 @@ init = ["echo init"]
         assert_eq!(created.user, params.user);
         assert_eq!(created.init, params.init);
         assert_eq!(created.network_backend, params.network_backend);
+        assert_eq!(created.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(created.dns_filter_hosts, params.dns_filter_hosts);
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
@@ -781,6 +831,8 @@ init = ["echo init"]
         assert_eq!(persisted.user, params.user);
         assert_eq!(persisted.init, params.init);
         assert_eq!(persisted.network_backend, params.network_backend);
+        assert_eq!(persisted.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(persisted.dns_filter_hosts, params.dns_filter_hosts);
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -802,12 +854,13 @@ init = ["echo init"]
         assert!(manifest.env.contains(&"GREETING=hello".to_string()));
         assert_eq!(manifest.workdir, params.workdir);
         assert_eq!(manifest.user, params.user);
+        assert_eq!(manifest.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(manifest.dns_filter_hosts, params.dns_filter_hosts);
 
         // Hop 4: pack manifest -> what a packed machine launches with, the
         // `pack run` and standalone-binary paths. The manifest fills every
         // setting the command line leaves out, and the command line wins for
         // each one it gives.
-        use crate::cli::pack_run::resolve_packed_launch;
         let no_secrets = std::collections::BTreeMap::new();
         let launch = resolve_packed_launch(&manifest, &[], &[], &no_secrets, None, None).unwrap();
         assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
@@ -816,6 +869,13 @@ init = ["echo init"]
             .contains(&("GREETING".to_string(), "hello".to_string())));
         assert_eq!(launch.workdir, params.workdir);
         assert_eq!(launch.user, params.user);
+        assert_eq!(
+            effective_pack_allow_list(None, &manifest).unwrap(),
+            (
+                params.allowed_cidrs.clone(),
+                params.dns_filter_hosts.clone()
+            )
+        );
         let overridden = resolve_packed_launch(
             &manifest,
             &["id".to_string()],
