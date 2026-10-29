@@ -467,28 +467,46 @@ fn effective_network(
     }
 }
 
-/// Effective egress allow-list (`allowed_cidrs`, `dns_filter_hosts`) for a
-/// packed run: an explicit caller egress override (`network_override`,
-/// `allowed_cidrs`, or `dns_filter_hosts`) replaces the manifest's allow-list
-/// as a unit; otherwise the manifest's validated allow-list is preserved.
+/// Effective egress policy (`allowed_cidrs`, `dns_filter_hosts`, `egress_rules`)
+/// for a packed run: an explicit caller egress override replaces the manifest's
+/// corresponding fields; otherwise the manifest's validated egress is preserved.
 pub(crate) fn effective_pack_allow_list(
     egress: Option<&ResolvedEgressPolicy>,
     manifest: &smolvm_pack::PackManifest,
-) -> smolvm::Result<smolvm::pack_export::ValidatedEgressAllowList> {
-    let (manifest_cidrs, manifest_hosts) =
-        smolvm::pack_export::validated_manifest_egress(manifest)?;
-    if let Some(policy) = egress {
-        if policy.network_override.is_some()
-            || policy.allowed_cidrs.is_some()
-            || policy.dns_filter_hosts.is_some()
-        {
-            return Ok((
+) -> smolvm::Result<smolvm::pack_export::ValidatedManifestEgress> {
+    let manifest_egress = smolvm::pack_export::validated_manifest_egress(manifest)?;
+    let Some(policy) = egress else {
+        return Ok(manifest_egress);
+    };
+    if policy.network_override.is_some() {
+        return Ok(smolvm::pack_export::ValidatedManifestEgress {
+            allowed_cidrs: policy.allowed_cidrs.clone(),
+            dns_filter_hosts: policy.dns_filter_hosts.clone(),
+            egress_rules: policy.egress_rules.clone(),
+        });
+    }
+    let (allowed_cidrs, dns_filter_hosts) =
+        if policy.allowed_cidrs.is_some() || policy.dns_filter_hosts.is_some() {
+            (
                 policy.allowed_cidrs.clone(),
                 policy.dns_filter_hosts.clone(),
-            ));
-        }
-    }
-    Ok((manifest_cidrs, manifest_hosts))
+            )
+        } else {
+            (
+                manifest_egress.allowed_cidrs,
+                manifest_egress.dns_filter_hosts,
+            )
+        };
+    let egress_rules = if policy.egress_rules.is_empty() {
+        manifest_egress.egress_rules
+    } else {
+        policy.egress_rules.clone()
+    };
+    Ok(smolvm::pack_export::ValidatedManifestEgress {
+        allowed_cidrs,
+        dns_filter_hosts,
+        egress_rules,
+    })
 }
 
 fn resolve_pack_allow_list_hosts(
@@ -609,14 +627,18 @@ impl PackRunCmd {
             }
         }
         let ssh_agent_socket = resolve_ssh_agent_socket(self.ssh_agent)?;
-        let (mut effective_allowed_cidrs, effective_dns_filter_hosts) =
-            effective_pack_allow_list(self.egress.as_ref(), &manifest)?;
+        let smolvm::pack_export::ValidatedManifestEgress {
+            allowed_cidrs: mut effective_allowed_cidrs,
+            dns_filter_hosts: effective_dns_filter_hosts,
+            egress_rules: effective_egress_rules,
+        } = effective_pack_allow_list(self.egress.as_ref(), &manifest)?;
         let network_enabled = effective_network(
             self.egress.as_ref(),
             self.net,
             manifest.network
                 || effective_allowed_cidrs.is_some()
-                || effective_dns_filter_hosts.is_some(),
+                || effective_dns_filter_hosts.is_some()
+                || !effective_egress_rules.is_empty(),
             !self.port.is_empty(),
         );
         if network_enabled {
@@ -737,11 +759,7 @@ impl PackRunCmd {
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: effective_allowed_cidrs,
-            egress_rules: self
-                .egress
-                .as_ref()
-                .map(|policy| policy.egress_rules.clone())
-                .unwrap_or_default(),
+            egress_rules: effective_egress_rules,
         };
         validate_requested_network_backend(
             &resources,
@@ -1953,12 +1971,16 @@ fn run_from_cache(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = ports.clone();
-    let (mut effective_allowed_cidrs, effective_dns_filter_hosts) =
-        effective_pack_allow_list(None, manifest)?;
+    let smolvm::pack_export::ValidatedManifestEgress {
+        allowed_cidrs: mut effective_allowed_cidrs,
+        dns_filter_hosts: effective_dns_filter_hosts,
+        egress_rules: effective_egress_rules,
+    } = effective_pack_allow_list(None, manifest)?;
     let network_enabled = args.net
         || manifest.network
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
+        || !effective_egress_rules.is_empty()
         || !ports.is_empty();
     if network_enabled {
         resolve_pack_allow_list_hosts(
@@ -1990,7 +2012,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: effective_allowed_cidrs,
-        egress_rules: Vec::new(),
+        egress_rules: effective_egress_rules,
     };
     validate_requested_network_backend(
         &resources,
@@ -2401,12 +2423,16 @@ fn daemon_start(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = ports.clone();
-    let (mut effective_allowed_cidrs, effective_dns_filter_hosts) =
-        effective_pack_allow_list(None, &manifest)?;
+    let smolvm::pack_export::ValidatedManifestEgress {
+        allowed_cidrs: mut effective_allowed_cidrs,
+        dns_filter_hosts: effective_dns_filter_hosts,
+        egress_rules: effective_egress_rules,
+    } = effective_pack_allow_list(None, &manifest)?;
     let network_enabled = args.net
         || manifest.network
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
+        || !effective_egress_rules.is_empty()
         || !ports.is_empty();
     if network_enabled {
         resolve_pack_allow_list_hosts(
@@ -2438,7 +2464,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: effective_allowed_cidrs,
-        egress_rules: Vec::new(),
+        egress_rules: effective_egress_rules,
     };
     validate_requested_network_backend(
         &resources,
@@ -2885,35 +2911,48 @@ mod tests {
         );
         manifest.allowed_cidrs = Some(vec!["1.1.1.1/32".to_string()]);
         manifest.dns_filter_hosts = Some(vec!["pypi.org".to_string()]);
+        manifest.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
 
-        // Direct `pack run` (`egress: None`) keeps the manifest's allow-list.
+        // Direct `pack run` (`egress: None`) keeps the manifest's allow-list and rules.
         assert_eq!(
             effective_pack_allow_list(None, &manifest).unwrap(),
-            (
-                Some(vec!["1.1.1.1/32".to_string()]),
-                Some(vec!["pypi.org".to_string()])
-            )
+            smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
+                dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
+                egress_rules: manifest.egress_rules.clone(),
+            }
         );
 
         // `machine run` handoff with no egress flags (`ResolvedEgressPolicy::default()`)
-        // also keeps the manifest's allow-list.
+        // also keeps the manifest's allow-list and rules.
         let empty = ResolvedEgressPolicy::default();
         assert_eq!(
             effective_pack_allow_list(Some(&empty), &manifest).unwrap(),
-            (
-                Some(vec!["1.1.1.1/32".to_string()]),
-                Some(vec!["pypi.org".to_string()])
-            )
+            smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
+                dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
+                egress_rules: manifest.egress_rules.clone(),
+            }
         );
 
-        // Any explicit caller allow-list replaces the manifest's allow-list as a unit.
+        // Any explicit caller allow-list replaces the manifest's allow-list as a unit
+        // while keeping the manifest's deny rules unless overridden.
         let override_hosts = ResolvedEgressPolicy {
             dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
             ..Default::default()
         };
         assert_eq!(
             effective_pack_allow_list(Some(&override_hosts), &manifest).unwrap(),
-            (None, Some(vec!["*.example.com".to_string()]))
+            smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: None,
+                dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
+                egress_rules: manifest.egress_rules,
+            }
         );
     }
 

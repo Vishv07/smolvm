@@ -804,6 +804,11 @@ pub struct PackManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 
+    /// Ordered outbound egress rules carried with the pack (`--deny-cidr` /
+    /// `--allow-udp`), deny rules first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -935,6 +940,7 @@ impl PackManifest {
             network: false,
             allowed_cidrs: None,
             dns_filter_hosts: None,
+            egress_rules: Vec::new(),
             gpu: false,
             cuda: false,
             host_platform,
@@ -989,8 +995,10 @@ mod tests {
             "empty secret_refs must not be serialized"
         );
         assert!(
-            !json.contains("allowed_cidrs") && !json.contains("dns_filter_hosts"),
-            "absent egress allow-list fields must not be serialized"
+            !json.contains("allowed_cidrs")
+                && !json.contains("dns_filter_hosts")
+                && !json.contains("egress_rules"),
+            "absent egress fields must not be serialized"
         );
 
         let mut m = empty;
@@ -999,6 +1007,12 @@ mod tests {
             "pypi.org".to_string(),
             "*.files.pythonhosted.org".to_string(),
         ]);
+        m.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
         m.secret_refs.insert(
             "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
@@ -1015,6 +1029,7 @@ mod tests {
         );
         assert_eq!(restored.allowed_cidrs, m.allowed_cidrs);
         assert_eq!(restored.dns_filter_hosts, m.dns_filter_hosts);
+        assert_eq!(restored.egress_rules, m.egress_rules);
     }
 
     #[test]

@@ -521,6 +521,8 @@ pub struct PackConfig {
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames and patterns from `[network].allow_hosts` / `allow_host_patterns`.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered egress rules from `[network].deny_cidrs` / `allow_udp`.
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
     /// Secrets carried into the pack manifest as references. They are resolved
@@ -609,6 +611,7 @@ pub fn resolve_pack_config_with_defaults(
                 net: None,
                 allowed_cidrs: None,
                 dns_filter_hosts: None,
+                egress_rules: Vec::new(),
                 gpu: cli_gpu,
                 secret_refs: Default::default(),
             });
@@ -651,7 +654,7 @@ pub fn resolve_pack_config_with_defaults(
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
 
-    let (allowed_cidrs, dns_filter_hosts) = match sf.network.as_ref() {
+    let (allowed_cidrs, dns_filter_hosts, egress_rules) = match sf.network.as_ref() {
         Some(network) => {
             let cidrs = network
                 .allow_cidrs
@@ -667,12 +670,27 @@ pub fn resolve_pack_config_with_defaults(
                     })?,
                 );
             }
+            let deny_cidrs = network
+                .deny_cidrs
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] deny_cidrs", e))?;
+            let mut rules = crate::cli::vm_common::deny_cidr_rules(&deny_cidrs);
+            let allow_udp = network
+                .allow_udp
+                .iter()
+                .map(|s| smolvm::smolfile::parse_allow_udp(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] allow_udp", e))?;
+            rules.extend(allow_udp);
             (
                 (!cidrs.is_empty()).then_some(cidrs),
                 (!hosts.is_empty()).then_some(hosts),
+                rules,
             )
         }
-        None => (None, None),
+        None => (None, None, Vec::new()),
     };
 
     Ok(PackConfig {
@@ -685,7 +703,7 @@ pub fn resolve_pack_config_with_defaults(
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
         user: sf.user,
-        // [network] host entries / allow_cidrs implies net = true,
+        // [network] host entries / allow_cidrs / deny_cidrs / allow_udp implies net = true,
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
@@ -693,6 +711,8 @@ pub fn resolve_pack_config_with_defaults(
                 !n.allow_hosts.is_empty()
                     || !n.allow_host_patterns.is_empty()
                     || !n.allow_cidrs.is_empty()
+                    || !n.deny_cidrs.is_empty()
+                    || !n.allow_udp.is_empty()
                     || !n.credentials.is_empty()
             });
             if network_section_implies_net {
@@ -703,6 +723,7 @@ pub fn resolve_pack_config_with_defaults(
         },
         allowed_cidrs,
         dns_filter_hosts,
+        egress_rules,
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
         secret_refs: sf.secrets,
@@ -773,6 +794,7 @@ init = ["echo init"]
 [network]
 allow_cidrs = ["1.1.1.1/32"]
 allow_host_patterns = ["*.example.com"]
+deny_cidrs = ["10.0.0.0/8"]
 "#,
         )
         .unwrap();
@@ -792,12 +814,15 @@ allow_host_patterns = ["*.example.com"]
             params.dns_filter_hosts,
             Some(vec!["*.example.com".to_string()])
         );
+        assert_eq!(params.egress_rules.len(), 1);
+        assert_eq!(params.egress_rules[0].cidr.as_deref(), Some("10.0.0.0/8"));
 
         // Hop 1b: Smolfile -> pack config, the `pack create --smolfile` path.
         let pack_config =
             resolve_pack_config(None, None, None, None, None, false, Some(path)).unwrap();
         assert_eq!(pack_config.allowed_cidrs, params.allowed_cidrs);
         assert_eq!(pack_config.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(pack_config.egress_rules, params.egress_rules);
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -817,6 +842,7 @@ allow_host_patterns = ["*.example.com"]
         assert_eq!(created.network_backend, params.network_backend);
         assert_eq!(created.allowed_cidrs, params.allowed_cidrs);
         assert_eq!(created.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(created.egress_rules, params.egress_rules);
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
@@ -833,6 +859,7 @@ allow_host_patterns = ["*.example.com"]
         assert_eq!(persisted.network_backend, params.network_backend);
         assert_eq!(persisted.allowed_cidrs, params.allowed_cidrs);
         assert_eq!(persisted.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(persisted.egress_rules, params.egress_rules);
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -856,6 +883,7 @@ allow_host_patterns = ["*.example.com"]
         assert_eq!(manifest.user, params.user);
         assert_eq!(manifest.allowed_cidrs, params.allowed_cidrs);
         assert_eq!(manifest.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(manifest.egress_rules, params.egress_rules);
 
         // Hop 4: pack manifest -> what a packed machine launches with, the
         // `pack run` and standalone-binary paths. The manifest fills every
@@ -871,10 +899,11 @@ allow_host_patterns = ["*.example.com"]
         assert_eq!(launch.user, params.user);
         assert_eq!(
             effective_pack_allow_list(None, &manifest).unwrap(),
-            (
-                params.allowed_cidrs.clone(),
-                params.dns_filter_hosts.clone()
-            )
+            smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: params.allowed_cidrs.clone(),
+                dns_filter_hosts: params.dns_filter_hosts.clone(),
+                egress_rules: params.egress_rules.clone(),
+            }
         );
         let overridden = resolve_packed_launch(
             &manifest,
@@ -1622,5 +1651,31 @@ mod cli_entrypoint_tests {
         .expect("resolves");
 
         assert_eq!(cfg.entrypoint, vec!["/app/run"]);
+    }
+
+    #[test]
+    fn smolfile_deny_cidrs_and_allow_udp_reach_pack_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"10.0.0.0/8\"]\nallow_udp = [\"1.1.1.1/32:53\"]\n",
+        )
+        .expect("write");
+
+        let cfg =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
+        assert_eq!(cfg.net, Some(true));
+        assert_eq!(cfg.egress_rules.len(), 2);
+        assert_eq!(cfg.egress_rules[0].cidr.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(
+            cfg.egress_rules[0].action,
+            smolvm_protocol::RuleAction::Deny
+        );
+        assert_eq!(cfg.egress_rules[1].cidr.as_deref(), Some("1.1.1.1/32"));
+        assert_eq!(
+            cfg.egress_rules[1].action,
+            smolvm_protocol::RuleAction::Allow
+        );
     }
 }

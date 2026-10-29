@@ -5259,8 +5259,11 @@ impl CreateCmd {
             }
         }
 
-        let (manifest_allowed_cidrs, manifest_dns_filter_hosts) =
-            smolvm::pack_export::validated_manifest_egress(&manifest)?;
+        let smolvm::pack_export::ValidatedManifestEgress {
+            allowed_cidrs: manifest_allowed_cidrs,
+            dns_filter_hosts: manifest_dns_filter_hosts,
+            egress_rules: manifest_egress_rules,
+        } = smolvm::pack_export::validated_manifest_egress(&manifest)?;
         let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
             self.allow_host.clone(),
@@ -5269,7 +5272,7 @@ impl CreateCmd {
             self.net,
         )?;
         let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
-            manifest.network,
+            manifest.network || !manifest_egress_rules.is_empty(),
             manifest_allowed_cidrs,
             manifest_dns_filter_hosts,
             cli_allow_cidrs,
@@ -5469,7 +5472,7 @@ impl CreateCmd {
             // Captured rules first, as allowed_cidrs prefers the checkpoint's.
             egress_rules: checkpoint_network
                 .map(|captured| captured.egress_rules.clone())
-                .unwrap_or_default(),
+                .unwrap_or(manifest_egress_rules),
             restart_policy: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())

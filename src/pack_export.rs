@@ -246,6 +246,7 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.network = vm.network;
     manifest.allowed_cidrs = vm.allowed_cidrs.clone();
     manifest.dns_filter_hosts = vm.dns_filter_hosts.clone();
+    manifest.egress_rules = vm.egress_rules.clone();
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
     // Carry the record's (entrypoint, cmd) through as-is. An empty entrypoint
@@ -264,15 +265,23 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.secret_refs = vm.secret_refs.clone();
 }
 
-/// Validated `(allowed_cidrs, dns_filter_hosts)` pair extracted from a pack manifest.
-pub type ValidatedEgressAllowList = (Option<Vec<String>>, Option<Vec<String>>);
+/// Validated outbound egress fields extracted from a [`PackManifest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedManifestEgress {
+    /// Outbound CIDR allow-list carried with the pack.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames and patterns permitted by the guest DNS filter.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered outbound egress rules (`--deny-cidr` / `--allow-udp`).
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+}
 
-/// Validate and normalize the outbound allow-list carried by an untrusted
-/// [`PackManifest`], holding its CIDRs and host patterns to the same rules
-/// `machine create` enforces.
+/// Validate and normalize the outbound egress policy carried by an untrusted
+/// [`PackManifest`], holding its CIDRs, host patterns, and egress rules to the
+/// same rules `machine create` enforces.
 pub fn validated_manifest_egress(
     manifest: &PackManifest,
-) -> crate::Result<ValidatedEgressAllowList> {
+) -> crate::Result<ValidatedManifestEgress> {
     let allowed_cidrs = match &manifest.allowed_cidrs {
         Some(cidrs) => Some(
             cidrs
@@ -293,7 +302,32 @@ pub fn validated_manifest_egress(
         ),
         None => None,
     };
-    Ok((allowed_cidrs, dns_filter_hosts))
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&manifest.egress_rules)
+        .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+    let egress_rules = manifest
+        .egress_rules
+        .iter()
+        .map(|rule| {
+            let cidr = rule
+                .cidr
+                .as_deref()
+                .map(crate::smolfile::parse_cidr)
+                .transpose()
+                .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+            Ok(smolvm_protocol::EgressRule {
+                transport: rule.transport,
+                cidr,
+                ports: rule.ports,
+                action: rule.action,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(ValidatedManifestEgress {
+        allowed_cidrs,
+        dns_filter_hosts,
+        egress_rules,
+    })
 }
 
 fn validate_packed_host_entry(entry: &str) -> std::result::Result<String, String> {
@@ -1838,7 +1872,7 @@ mod env_merge_tests {
 mod from_vm_manifest_tests {
     use super::{
         export_dns, export_overlay_owner, seed_manifest_from_vm, validated_manifest_egress,
-        FromVmAssets,
+        FromVmAssets, ValidatedManifestEgress,
     };
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
@@ -1946,11 +1980,11 @@ mod from_vm_manifest_tests {
     }
 
     /// Issue #1989: packing a networked machine that was scoped with
-    /// `--allow-host` or `--allow-cidr` must carry that allow-list into the
-    /// manifest instead of leaving `manifest.network = true` with no allow-list
-    /// (which silently widened the packed machine to open internet).
+    /// `--allow-host`, `--allow-cidr`, or `--deny-cidr` must carry that egress
+    /// policy into the manifest instead of leaving `manifest.network = true`
+    /// with no rules (which silently widened the packed machine to open internet).
     #[test]
-    fn seed_manifest_from_vm_preserves_egress_allow_list() {
+    fn seed_manifest_from_vm_preserves_egress_allow_list_and_rules() {
         let mut rec = record("scoped");
         rec.network = true;
         rec.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
@@ -1959,6 +1993,12 @@ mod from_vm_manifest_tests {
             "=exact.example.com".to_string(),
             "*.files.pythonhosted.org".to_string(),
         ]);
+        rec.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
 
         let mut m = manifest();
         seed_manifest_from_vm(&mut m, &rec, &assets());
@@ -1966,14 +2006,19 @@ mod from_vm_manifest_tests {
         assert!(m.network);
         assert_eq!(m.allowed_cidrs, rec.allowed_cidrs);
         assert_eq!(m.dns_filter_hosts, rec.dns_filter_hosts);
+        assert_eq!(m.egress_rules, rec.egress_rules);
         assert_eq!(
             validated_manifest_egress(&m).unwrap(),
-            (rec.allowed_cidrs, rec.dns_filter_hosts)
+            ValidatedManifestEgress {
+                allowed_cidrs: rec.allowed_cidrs,
+                dns_filter_hosts: rec.dns_filter_hosts,
+                egress_rules: rec.egress_rules,
+            }
         );
     }
 
     #[test]
-    fn validated_manifest_egress_rejects_malformed_cidrs_and_hosts() {
+    fn validated_manifest_egress_rejects_malformed_cidrs_hosts_and_rules() {
         let mut bad_cidr = manifest();
         bad_cidr.allowed_cidrs = Some(vec!["not-a-cidr".to_string()]);
         assert!(validated_manifest_egress(&bad_cidr).is_err());
@@ -1986,6 +2031,15 @@ mod from_vm_manifest_tests {
                 "{bad_host:?} must be rejected"
             );
         }
+
+        let mut bad_rule = manifest();
+        bad_rule.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("not-a-cidr".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+        assert!(validated_manifest_egress(&bad_rule).is_err());
     }
 
     /// A branched or checkpoint-restored machine keeps writing to its source's
